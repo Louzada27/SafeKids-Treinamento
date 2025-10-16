@@ -1,8 +1,10 @@
-     Nenhuma       0.72      1.00      0.84       129
-        Leve       0.79      0.68      0.73       118
-    Moderado       0.78      0.82      0.80       214
-      Severo       0.97      0.74      0.84       170
+             precision    recall  f1-score   support
 
-    accuracy                           0.81       631
-   macro avg       0.82      0.81      0.80       631
-weighted avg       0.82      0.81      0.81       631
+     Nenhuma       0.95      0.98      0.97       129
+        Leve       0.59      0.84      0.69       118
+    Moderado       0.81      0.67      0.73       214
+      Severo       0.86      0.78      0.82       170
+
+    accuracy                           0.80       631
+   macro avg       0.80      0.82      0.80       631
+weighted avg       0.81      0.80      0.80       631

@@ -1,10 +1,17 @@
 import os
 import logging
+import torch
 import argparse
 import pandas as pd
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
 from transformers import (
     BertForSequenceClassification,
     BertTokenizerFast,
@@ -12,9 +19,8 @@ from transformers import (
     TrainingArguments,
     EarlyStoppingCallback
 )
-import torch
 import numpy as np
-from torch import nn, optim
+import matplotlib.pyplot as plt
 
 # -------------------
 # Logging
@@ -26,19 +32,11 @@ logger = logging.getLogger(__name__)
 # Configurações
 # -------------------
 CLASSES = ["Nenhuma", "Leve", "Moderado", "Severo"]
-
-# Thresholds independentes para cada classe (ajuste conforme experimentos)
-CLASS_THRESHOLDS = {
-    "Nenhuma": 0.56, #ok
-    "Leve": 0.5,
-    "Moderado": 0.5, #ok
-    "Severo": 0.6 #ok
-}
+THRESHOLD_LEVE = 0.45  # Threshold aplicado somente à classe Leve
 
 # -------------------
 # Funções
 # -------------------
-
 def load_dataset(file_path: str, text_column: str, label_column: str):
     logger.info(f"Carregando dataset de {file_path}")
 
@@ -61,16 +59,16 @@ def load_dataset(file_path: str, text_column: str, label_column: str):
     logger.info(f"Divisão - Treino: {len(train_df)}, Validação: {len(val_df)}, Teste: {len(test_df)}")
     return Dataset.from_pandas(train_df), Dataset.from_pandas(val_df), Dataset.from_pandas(test_df), df
 
-
 def preprocess_data(train_ds, val_ds, test_ds, tokenizer, text_column, label_column, max_length=128):
     def tokenize(batch):
         return tokenizer(batch[text_column], padding="max_length", truncation=True, max_length=max_length)
-    
+
     train_ds = train_ds.map(tokenize, batched=True)
     val_ds = val_ds.map(tokenize, batched=True)
     test_ds = test_ds.map(tokenize, batched=True)
 
     label_map = {label: i for i, label in enumerate(CLASSES)}
+
     def encode_labels(batch):
         batch["labels"] = [label_map[label] for label in batch[label_column]]
         return batch
@@ -86,44 +84,41 @@ def preprocess_data(train_ds, val_ds, test_ds, tokenizer, text_column, label_col
 
     return train_ds, val_ds, test_ds
 
-
 def compute_metrics(pred):
     labels = pred.label_ids
     preds = pred.predictions.argmax(-1)
-
     precision, recall, f1, support = precision_recall_fscore_support(labels, preds, average=None, zero_division=0)
     acc = accuracy_score(labels, preds)
 
-    per_class_metrics = {}
-    total_support = sum(support)
-    weighted_precision = weighted_recall = weighted_f1 = 0
+    metrics = {"eval_accuracy": acc}
+    f1_weighted = np.average(f1, weights=support)
+    metrics["eval_f1_weighted"] = f1_weighted
 
     for i, cls in enumerate(CLASSES):
-        per_class_metrics[cls] = {
-            "precision": precision[i],
-            "recall": recall[i],
-            "f1": f1[i],
-            "support": support[i]
-        }
-        weighted_precision += precision[i] * support[i]
-        weighted_recall += recall[i] * support[i]
-        weighted_f1 += f1[i] * support[i]
-
-    metrics = {
-        "accuracy": acc,
-        "precision_mean": weighted_precision / total_support,
-        "recall_mean": weighted_recall / total_support,
-        "f1": weighted_f1 / total_support
-    }
-    metrics.update(per_class_metrics)
+        metrics[f"eval_{cls}_precision"] = precision[i]
+        metrics[f"eval_{cls}_recall"] = recall[i]
+        metrics[f"eval_{cls}_f1"] = f1[i]
     return metrics
 
+def train_model(model_name, train_ds, val_ds, output_dir, df, label_column, epochs=8, batch_size=16, lr=5e-5):
+    logger.info(f"Treinando modelo {model_name} com peso fixo apenas para classe 'Leve'")
 
-def train_model(model_name, train_ds, val_ds, output_dir, epochs=5, batch_size=16, lr=5e-5):
-    logger.info(f"Treinando modelo {model_name} para {len(CLASSES)} classes")
-    
     model = BertForSequenceClassification.from_pretrained(model_name, num_labels=len(CLASSES))
-    
+
+    # Peso fixo apenas para a classe "Leve"
+    weights = torch.ones(len(CLASSES), dtype=torch.float)
+    idx_leve = CLASSES.index("Leve")
+    weights[idx_leve] = 3.0  # peso fixo
+
+    class WeightedTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.get("labels")
+            outputs = model(**inputs)
+            logits = outputs.get("logits")
+            loss_fct = torch.nn.CrossEntropyLoss(weight=weights.to(model.device))
+            loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
+            return (loss, outputs) if return_outputs else loss
+
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -134,12 +129,12 @@ def train_model(model_name, train_ds, val_ds, output_dir, epochs=5, batch_size=1
         logging_steps=10,
         eval_strategy="epoch",
         save_strategy="epoch",
-        metric_for_best_model="f1",
-        save_total_limit=2,
-        load_best_model_at_end=True
+        metric_for_best_model="eval_f1_weighted",  # corrigido
+        load_best_model_at_end=True,
+        save_total_limit=2
     )
 
-    trainer = Trainer(
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -152,88 +147,28 @@ def train_model(model_name, train_ds, val_ds, output_dir, epochs=5, batch_size=1
     trainer.save_model(output_dir)
     return model
 
-
-# -------------------
-# Calibração de Temperatura
-# -------------------
-class ModelWithTemperature(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        # Cria o parâmetro de temperatura antes de enviar pro device
-        self.temperature = nn.Parameter(torch.ones(1) * 1.5)  #
-
-    def forward(self, **inputs):
-        outputs = self.model(**inputs)
-        logits = outputs.logits
-        return logits / self.temperature
-
-    def set_temperature(self, val_loader):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(device)
-        logits_list, labels_list = [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                inputs = {k: v.to(device) for k, v in batch.items()}
-                logits = self.model(**inputs).logits
-                logits_list.append(logits)
-                labels_list.append(inputs["labels"])
-        logits = torch.cat(logits_list)
-        labels = torch.cat(labels_list)
-
-        nll_criterion = nn.CrossEntropyLoss()
-        optimizer = optim.LBFGS([self.temperature], lr=0.01, max_iter=50)
-
-        def eval():
-            optimizer.zero_grad()
-            loss = nll_criterion(logits / self.temperature, labels)
-            loss.backward()
-            return loss
-
-        optimizer.step(eval)
-        logger.info(f"Temperatura calibrada: {self.temperature.item():.4f}")
-        return self
-
-
-def calibrate_model(model, val_ds):
-    from torch.utils.data import DataLoader
-    val_loader = DataLoader(val_ds, batch_size=32)
-    calibrated_model = ModelWithTemperature(model)
-    calibrated_model.set_temperature(val_loader)
-    return calibrated_model
-
-
-def predict_with_thresholds(model, tokenizer, texts, thresholds, temperature=1.0):
+def predict_with_leve_threshold(model, tokenizer, texts, threshold=THRESHOLD_LEVE):
     model.eval()
     predictions = []
+
     for text in texts:
         inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
         with torch.no_grad():
             logits = model(**inputs).logits
-            probs = torch.softmax(logits / temperature, dim=-1).numpy()[0]
+            probs = torch.softmax(logits, dim=-1).numpy()[0]
 
-        # Aplica thresholds específicos por classe
-        pred_class = "Nenhuma"
-        for i, cls in enumerate(CLASSES):
-            if probs[i] >= thresholds[cls]:
-                pred_class = cls
-                break
+        idx_leve = CLASSES.index("Leve")
+        if probs[idx_leve] >= threshold and probs[idx_leve] > probs.argmax() - 0.05:
+            pred_class = "Leve"
+        else:
+            pred_class = CLASSES[probs.argmax()]
+
         predictions.append(pred_class)
+
     return predictions
 
-
-def evaluate_model(model, test_ds):
-    trainer = Trainer(model=model, compute_metrics=compute_metrics)
-    results = trainer.evaluate(test_ds)
-    logger.info(f"Resultados da avaliação: {results}")
-    return results
-
-
-# -------------------
-# Main
-# -------------------
 def main():
-    parser = argparse.ArgumentParser(description="Treinamento BERTimbau multiclasse TOX com calibração de temperatura e thresholds por classe")
+    parser = argparse.ArgumentParser(description="Treinamento BERTimbau com class weight e threshold Leve")
     parser.add_argument('--data_path', type=str, default='Treinamento/TOX/TOX_processado.csv')
     parser.add_argument('--text_column', type=str, default='FRASE')
     parser.add_argument('--label_column', type=str, default='Intensidade')
@@ -250,32 +185,26 @@ def main():
     train_ds, val_ds, test_ds, df = load_dataset(args.data_path, args.text_column, args.label_column)
     train_ds, val_ds, test_ds = preprocess_data(train_ds, val_ds, test_ds, tokenizer, args.text_column, args.label_column, args.max_length)
 
-    output_dir_task = os.path.join(args.output_dir, "bertimbau_tox_thresholds")
+    output_dir_task = os.path.join(args.output_dir, "bertimbau_tox_leve_weighted")
     os.makedirs(output_dir_task, exist_ok=True)
 
-    model = train_model(args.model_name, train_ds, val_ds, output_dir_task, args.epochs, args.batch_size, args.learning_rate)
+    model = train_model(args.model_name, train_ds, val_ds, output_dir_task, df, args.label_column, args.epochs, args.batch_size, args.learning_rate)
 
-    # ---- Calibração de temperatura ----
-    logger.info("Iniciando calibração de temperatura...")
-    calibrated_model = calibrate_model(model, val_ds)
-    T_value = calibrated_model.temperature.item()
-    with open(os.path.join(output_dir_task, "temperature.txt"), "w") as f:
-        f.write(f"{T_value:.4f}")
-
-    # ---- Avaliação final ----
+    # Predição com threshold só na classe "Leve"
     texts = df[args.text_column].tolist()
-    preds = predict_with_thresholds(model, tokenizer, texts, thresholds=CLASS_THRESHOLDS, temperature=T_value)
+    preds = predict_with_leve_threshold(model, tokenizer, texts, threshold=THRESHOLD_LEVE)
     true_labels = df[args.label_column].tolist()
 
     print(classification_report(true_labels, preds, labels=CLASSES))
-    results = evaluate_model(model, test_ds)
-    results_file = os.path.join(output_dir_task, "evaluation_results.txt")
-    with open(results_file, "w") as f:
-        for k, v in results.items():
-            f.write(f"{k}: {v}\n")
 
-    logger.info(f"Treinamento e calibração concluídos. Modelo salvo em {output_dir_task}")
+    # Matriz de confusão
+    cm = confusion_matrix(true_labels, preds, labels=CLASSES)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=CLASSES)
+    disp.plot(cmap='Blues', xticks_rotation=45)
+    plt.title("Matriz de Confusão - Modelo BERTimbau TOX")
+    plt.show()
 
+    logger.info(f"Treinamento concluído. Modelo salvo em {output_dir_task}")
 
 if __name__ == "__main__":
     main()
