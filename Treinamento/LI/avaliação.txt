@@ -1,0 +1,4 @@
+Métrica	    Classe 0	Classe 1	Classe 2
+Precisão	1.000000	0.870229	0.854545
+Revocação	0.947368	0.832117	0.903846
+F1-Score	0.972973	0.850746	0.878505
